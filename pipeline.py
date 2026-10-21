@@ -48,7 +48,7 @@ class FaceExtractor:
         forehead_x = int(landmarks[151].x * w)
         forehead_y = int(landmarks[151].y * h)
 
-        box_size = 10
+        box_size = 30
         x1, y1 = max(0, forehead_x - box_size), max(0, forehead_y - box_size)
         x2, y2 = min(w, forehead_x + box_size), min(h, forehead_y + box_size)
 
@@ -101,6 +101,34 @@ class SignalProcessor:
 
         bpm = peak_freq * 60.0
         return bpm, filtered
+
+    def estimate_bpm_windowed(self, raw_signal: List[float], window_sec: int = 10, step_sec: int = 2) -> float:
+        """
+        Calculates the BPM using sliding windows to prevent global noise (like motion artifacts)
+        from overwhelming the cardiac signal.
+
+        Args:
+            raw_signal: List of mean color values per frame.
+            window_sec: Size of the sliding window in seconds.
+            step_sec: Step size between consecutive windows in seconds.
+
+        Returns:
+            The estimated heart rate (BPM) computed as the median of all windowed estimates.
+        """
+        window_frames = int(window_sec * self.fps)
+        step_frames = int(step_sec * self.fps)
+
+        if len(raw_signal) < window_frames:
+            bpm, _ = self.estimate_bpm(raw_signal)
+            return bpm
+
+        bpms = []
+        for i in range(0, len(raw_signal) - window_frames + 1, step_frames):
+            window_signal = raw_signal[i:i + window_frames]
+            bpm, _ = self.estimate_bpm(window_signal)
+            bpms.append(bpm)
+
+        return float(np.median(bpms))
 
 
 def read_ubfc_ground_truth(txt_path: str) -> float:
@@ -163,7 +191,7 @@ def evaluate_video(video_path: str, gt_path: str, model_path: str):
         print("Error: No face detected.")
         return
 
-    predicted_bpm, _ = processor.estimate_bpm(raw_signal)
+    predicted_bpm = processor.estimate_bpm_windowed(raw_signal, window_sec=10, step_sec=2)
 
     true_bpm = read_ubfc_ground_truth(gt_path)
 
