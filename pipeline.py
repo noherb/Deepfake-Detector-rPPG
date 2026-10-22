@@ -24,21 +24,14 @@ class FaceExtractor:
         )
         self.detector = vision.FaceLandmarker.create_from_options(options)
 
-    def extract_forehead_green(self, frame: np.ndarray) -> Optional[float]:
+    def extract_forehead_rgb(self, frame: np.ndarray) -> Optional[Tuple[float, float, float]]:
         """
-        Detects the face in the frame and returns the mean green channel value of the forehead ROI.
-
-        Args:
-            frame: BGR image array from OpenCV.
-
-        Returns:
-            Mean value of the green channel in the ROI, or None if no face is detected.
+        Extracts the mean Red, Green, and Blue values of the forehead ROI.
         """
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
 
         detection_result = self.detector.detect(mp_image)
-
         if not detection_result.face_landmarks:
             return None
 
@@ -56,7 +49,11 @@ class FaceExtractor:
         if roi.size == 0:
             return None
 
-        return np.mean(roi[:, :, 1])
+        mean_b = np.mean(roi[:, :, 0])
+        mean_g = np.mean(roi[:, :, 1])
+        mean_r = np.mean(roi[:, :, 2])
+
+        return (mean_r, mean_g, mean_b)
 
     def close(self):
         """Releases the MediaPipe resources."""
@@ -102,33 +99,71 @@ class SignalProcessor:
         bpm = peak_freq * 60.0
         return bpm, filtered
 
-    def estimate_bpm_windowed(self, raw_signal: List[float], window_sec: int = 10, step_sec: int = 2) -> float:
+    def estimate_bpm_windowed(self, raw_rgb_signal: List[Tuple[float, float, float]], window_sec: int = 10, step_sec: int = 2) -> float:
         """
         Calculates the BPM using sliding windows to prevent global noise (like motion artifacts)
         from overwhelming the cardiac signal.
 
         Args:
-            raw_signal: List of mean color values per frame.
+            raw_rgb_signal: List of RGB mean color values per frame (in tuples).
             window_sec: Size of the sliding window in seconds.
             step_sec: Step size between consecutive windows in seconds.
 
         Returns:
             The estimated heart rate (BPM) computed as the median of all windowed estimates.
         """
+        signal_array = np.array(raw_rgb_signal)
         window_frames = int(window_sec * self.fps)
         step_frames = int(step_sec * self.fps)
 
-        if len(raw_signal) < window_frames:
-            bpm, _ = self.estimate_bpm(raw_signal)
+        if len(signal_array) < window_frames:
+            pos_signal = self.apply_pos_algorithm(signal_array)
+            bpm, _ = self.estimate_bpm(pos_signal.tolist())
             return bpm
 
         bpms = []
-        for i in range(0, len(raw_signal) - window_frames + 1, step_frames):
-            window_signal = raw_signal[i:i + window_frames]
-            bpm, _ = self.estimate_bpm(window_signal)
+        for i in range(0, len(signal_array) - window_frames + 1, step_frames):
+            window_rgb = signal_array[i:i + window_frames]
+
+            pos_signal = self.apply_pos_algorithm(window_rgb)
+
+            bpm, _ = self.estimate_bpm(pos_signal.tolist())
             bpms.append(bpm)
 
         return float(np.median(bpms))
+
+    def apply_pos_algorithm(self, rgb_signal: np.ndarray) -> np.ndarray:
+        """
+        Applies the Plane-Orthogonal-to-Skin (POS) algorithm (Wang et al., 2016).
+
+        Args:
+            rgb_signal: Numpy array of shape (N_frames, 3) containing R, G, B means.
+
+        Returns:
+            1D numpy array representing the robust pulse signal.
+        """
+        mean_rgb = np.mean(rgb_signal, axis=0)
+
+        if np.any(mean_rgb == 0):
+            return rgb_signal[:, 1]
+
+        norm_rgb = rgb_signal / mean_rgb
+
+        rn = norm_rgb[:, 0]
+        gn = norm_rgb[:, 1]
+        bn = norm_rgb[:, 2]
+
+        # X aligns on blood variation, Y captures specular light
+        x = 3 * rn - 2 * gn
+        y = 1.5 * rn + gn - 1.5 * bn
+
+        std_x = np.std(x)
+        std_y = np.std(y)
+
+        alpha = std_x / std_y if std_y > 0 else 0
+
+        h_signal = x - alpha * y
+        return h_signal
 
 
 def read_ubfc_ground_truth(txt_path: str) -> float:
@@ -177,9 +212,9 @@ def evaluate_video(video_path: str, gt_path: str, model_path: str):
         if not ret:
             break
 
-        green_val = extractor.extract_forehead_green(frame)
-        if green_val is not None:
-            raw_signal.append(green_val)
+        rgb_val = extractor.extract_forehead_rgb(frame)
+        if rgb_val is not None:
+            raw_signal.append(rgb_val)
         elif len(raw_signal) > 0:
             # in case we lose signal
             raw_signal.append(raw_signal[-1])
